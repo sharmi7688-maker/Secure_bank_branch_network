@@ -431,7 +431,7 @@ def render_branch_auth():
     with tab_login:
         with st.container(border=True):
             st.markdown("#### Branch Sign In")
-            with st.form("branch_login_form"):
+            with st.form("branch_login_form", clear_on_submit=True):
                 branch_code_input = st.text_input("Branch Code", placeholder="e.g. SB001").strip().upper()
                 password_input = st.text_input("Password", type="password")
                 submitted = st.form_submit_button("Sign In", use_container_width=True)
@@ -493,7 +493,7 @@ def render_branch_auth():
                 "Password must be at least 10 characters and include an uppercase letter, "
                 "a lowercase letter, a digit, and a special character."
             )
-            with st.form("branch_register_form"):
+            with st.form("branch_register_form", clear_on_submit=True):
                 branch_name_input = st.text_input("Branch Name", placeholder="e.g. Bangalore")
                 new_password = st.text_input("Password", type="password")
                 confirm_password = st.text_input("Confirm Password", type="password")
@@ -561,7 +561,7 @@ def render_branch_dashboard():
                 st.info("No other branches are available to message yet.")
             else:
                 options = {f"{name} ({code})": bid for (bid, name, code) in other_branches}
-                with st.form("send_message_form"):
+                with st.form("send_message_form", clear_on_submit=True):
                     receiver_label = st.selectbox("Receiver Branch", list(options.keys()))
                     message_text = st.text_area("Message", max_chars=500, height=140, placeholder="Type your secure message (max 500 characters)...")
                     submitted = st.form_submit_button("Encrypt & Send", use_container_width=True)
@@ -729,7 +729,7 @@ def render_admin_auth():
     st.markdown("## \U0001F6E1\uFE0F Admin Portal")
     with st.container(border=True):
         st.markdown("#### Administrator Sign In")
-        with st.form("admin_login_form"):
+        with st.form("admin_login_form", clear_on_submit=True):
             username_input = st.text_input("Username")
             password_input = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Sign In", use_container_width=True)
@@ -877,7 +877,7 @@ def render_admin_dashboard():
             st.dataframe(rows, use_container_width=True, hide_index=True)
 
         st.markdown("##### Unlock / Reset a Branch")
-        with st.form("branch_security_form"):
+        with st.form("branch_security_form", clear_on_submit=True):
             branch_code_target = st.text_input("Branch Code", placeholder="e.g. SB003").strip().upper()
             col_a, col_b = st.columns(2)
             unlock_clicked = col_a.form_submit_button("Unlock Account", use_container_width=True)
@@ -936,7 +936,7 @@ def render_admin_dashboard():
             st.dataframe(rows, use_container_width=True, hide_index=True)
 
         st.markdown("##### Unlock / Reset an Administrator")
-        with st.form("admin_security_form"):
+        with st.form("admin_security_form", clear_on_submit=True):
             username_target = st.text_input("Admin Username").strip()
             col_a, col_b = st.columns(2)
             unlock_admin_clicked = col_a.form_submit_button("Unlock Account", use_container_width=True)
@@ -974,7 +974,7 @@ def render_admin_dashboard():
                 "Password must be at least 10 characters and include an uppercase letter, "
                 "a lowercase letter, a digit, and a special character."
             )
-            with st.form("admin_register_form"):
+            with st.form("admin_register_form", clear_on_submit=True):
                 new_username = st.text_input("Username")
                 new_password = st.text_input("Password", type="password")
                 confirm_password = st.text_input("Confirm Password", type="password")
