@@ -332,55 +332,38 @@ After successful branch authentication, the branch dashboard provides:
 
 # 🚀 Installation
 
-## 1. Clone or copy the project
+### 1. Download or clone the project
 
-```bash
 git clone <repository-url>
-```
 
-Or copy the project folder to your computer.
+### 2. Open the project folder
 
-## 2. Open the project
-
-```bash
 cd Secure_Bank_Branch_Network
-```
 
-## 3. Create a virtual environment
+### 3. Create a virtual environment
+
+python -m venv venv
+
+### 4. Activate the virtual environment
 
 Windows:
 
-```bash
-python -m venv venv
-```
-
-## 4. Activate the virtual environment
-
-```bash
 venv\Scripts\activate
-```
 
-## 5. Install dependencies
+### 5. Upgrade pip
 
-```bash
+python -m pip install --upgrade pip
+
+### 6. Install dependencies
+
 pip install -r requirements.txt
-```
 
-## 6. Run the application
+### 7. Run the Streamlit application
 
-For the Python application:
-
-```bash
-python main.py
-```
-
-For the Streamlit frontend, if applicable:
-
-```bash
-streamlit run frontend/app.py
-```
+streamlit run streamlit_app.py
 
 ---
+
 
 # 🔑 Default Administrator
 
