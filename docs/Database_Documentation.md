@@ -193,3 +193,15 @@ Additional database improvements could include:
 * Transaction management.
 * Automated backup.
 * Disaster recovery.
+
+---
+
+# Schema Changes (Final Project)
+
+Applied automatically by `database/migrations.py` (idempotent; existing data is kept).
+
+* `branches`, `admins`: `must_change_password`, `password_changed_date`, `temp_password_expires` (set while an administrator-issued temporary password is active).
+* `messages`: `priority`, `parent_message_id`, `key_id`, `aad_version`, `sender_status`, `receiver_status`. Subject and body are encrypted together in `encrypted_message`.
+* `activity_logs`, `admin_activity_logs`: `prev_hash`, `entry_hash` (audit chain).
+* New tables: `two_factor` (encrypted TOTP secrets), `audit_chain_head` (end-of-log record), `schema_meta` (schema version).
+* Keys are files in `config/`, not database rows.

@@ -1,0 +1,9 @@
+# Forces Streamlit's own widgets (menus, tables, charts, code boxes) to use
+# the light theme, whatever the browser/OS dark-mode setting is.
+[theme]
+base = "light"
+primaryColor = "#c9a227"
+backgroundColor = "#f7f9fd"
+secondaryBackgroundColor = "#e9eff8"
+textColor = "#14213d"
+font = "sans serif"

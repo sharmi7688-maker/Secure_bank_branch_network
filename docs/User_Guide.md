@@ -332,3 +332,21 @@ Administrators should regularly review:
 * Activity logs.
 * Message metadata.
 * Security events.
+
+---
+
+# New Features Guide
+
+**Two-factor authentication** (Branch: *Profile & Security*, Admin: *My Account*): choose *Set Up Two-Factor Authentication*, scan the QR code with an authenticator app (or type the key), enter the 6-digit code to confirm. From then on sign-in asks for the code after the password.
+
+**Change password:** same page; the meter shows strength live. If an administrator requires a change, you must do it before using the system.
+
+**Messages:** add a subject and priority when sending. Open a message with *Decrypt & View*; from there you can reply, archive, delete or restore. Use *Search & filter* above the list. Archived messages are in the *Archive* tab.
+
+**Auto sign-out:** after 10 minutes without activity you are signed out and must sign in again.
+
+**Administrators:** *Analytics* (charts), *Alerts* (suspicious activity), *Security Center* (verify audit log, rotate keys, re-encrypt, reset 2FA, require password change), CSV download buttons on the data tabs.
+
+**Forgot your password?** Contact your administrator. They issue a temporary password (*Security Center > Account Recovery > Issue temporary password*) and give it to you. Sign in with it (it works for 24 hours), enter it as the *current password* on the screen that appears, and choose a new password. If you also lost your authenticator phone, ask for *Reset 2FA* too.
+
+**Administrators who forgot their password:** another administrator can issue a temporary password the same way. If you are the only administrator, run `python -m modules.admin_recovery` in the project folder on the server.

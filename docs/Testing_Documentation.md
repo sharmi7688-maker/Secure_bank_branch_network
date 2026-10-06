@@ -204,3 +204,27 @@ Future versions should include:
 * Database failure testing.
 * Encryption/decryption testing.
 * Session-hijacking resistance testing.
+
+---
+
+# Automated Test Suite (Final Project)
+
+The older `modules/test_*.py` and `verify_*.py` helper scripts remain, but the real test suite is now in `tests/` and uses a temporary database and temporary keys, so it never touches `bank.db`.
+
+| Test file | Tests | Covers |
+|-----------|-------|--------|
+| `test_totp.py` | 9 | RFC 6238 vectors, drift window, replay step |
+| `test_two_factor.py` | 14 | enrolment, login codes, disable, admin reset, encrypted storage |
+| `test_auth_service.py` | 13 | sign-in, wrong/empty/unknown credentials, 3-strike lockout, administrator lockout, session timeout rules |
+| `test_password_policy.py` | 18 | strength meter, change password rules, lockout on wrong current password |
+| `test_encryption_keys.py` | 12 | key rotation, bound metadata, tamper detection, legacy messages |
+| `test_messaging.py` | 19 | send, reply rules, search, archive/delete, permissions |
+| `test_audit_chain.py` | 11 | sealing, edit/delete/insert/truncate detection |
+| `test_alerts_analytics_reports.py` | 17 | alert thresholds, chart data, CSV injection |
+| `test_migrations.py` | 5 | upgrade of an original-format database, idempotence |
+| `test_temp_password.py` | 17 | generator rules, sign-in and forced change, 24-hour expiry, no clear-text storage, audit on both sides, lockout cleared, 2FA interaction, self-issue blocked, console recovery |
+| **Total** | **135** | |
+
+Run: `python -m pytest` (or `python -m unittest discover -s tests -t .` without pytest).
+
+**UI smoke test:** `python tests/ui_smoke/run_ui_smoke.py` runs the real `streamlit_app.py` against a small fake Streamlit module in a temporary copy of the project and performs 61 checks (sign-in failures, 2FA set-up and login, messaging and replies, archive, password change, idle timeout, admin dashboard, key rotation, tamper detection, temporary-password recovery, light-theme CSS). It does not replace testing the visuals in a browser.

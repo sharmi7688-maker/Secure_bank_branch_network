@@ -1,5 +1,7 @@
 import sqlite3
 
+from modules.audit_chain import seal_entry
+
 
 def create_database():
     """
@@ -468,33 +470,48 @@ def log_activity(
 ):
     """
     Saves a branch activity to the activity_logs table.
+
+    The row is sealed into the tamper-evident audit chain
+    (see modules/audit_chain.py) in the same transaction.
     """
 
-    connection = sqlite3.connect("database/bank.db")
+    connection = sqlite3.connect("database/bank.db", timeout=10)
     cursor = connection.cursor()
 
-    cursor.execute("""
-        INSERT INTO activity_logs (
+    try:
+        # BEGIN IMMEDIATE serialises writers so the hash chain stays in order
+        cursor.execute("BEGIN IMMEDIATE")
+
+        cursor.execute("""
+            INSERT INTO activity_logs (
+                branch_id,
+                activity_type,
+                description,
+                activity_date
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
             branch_id,
             activity_type,
             description,
             activity_date
-        )
-        VALUES (?, ?, ?, ?)
-    """, (
-        branch_id,
-        activity_type,
-        description,
-        activity_date
-    ))
+        ))
 
-    connection.commit()
+        log_id = cursor.lastrowid
 
-    log_id = cursor.lastrowid
+        seal_entry(connection, "activity_logs", log_id)
 
-    connection.close()
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
 
     return log_id
+
 
 def get_activities_for_branch(branch_id):
     """
@@ -814,31 +831,44 @@ def log_admin_activity(
 ):
     """
     Records an administrator security activity.
+
+    The row is sealed into the tamper-evident audit chain
+    (see modules/audit_chain.py) in the same transaction.
     """
 
-    connection = sqlite3.connect("database/bank.db")
+    connection = sqlite3.connect("database/bank.db", timeout=10)
     cursor = connection.cursor()
 
-    cursor.execute("""
-        INSERT INTO admin_activity_logs (
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        cursor.execute("""
+            INSERT INTO admin_activity_logs (
+                admin_id,
+                activity_type,
+                description,
+                activity_date
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
             admin_id,
             activity_type,
             description,
             activity_date
-        )
-        VALUES (?, ?, ?, ?)
-    """, (
-        admin_id,
-        activity_type,
-        description,
-        activity_date
-    ))
+        ))
 
-    connection.commit()
+        log_id = cursor.lastrowid
 
-    log_id = cursor.lastrowid
+        seal_entry(connection, "admin_activity_logs", log_id)
 
-    connection.close()
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
 
     return log_id
 

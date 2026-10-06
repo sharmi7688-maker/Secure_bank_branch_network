@@ -2,15 +2,17 @@
 # SECURE BANK — BRANCH NETWORK SYSTEM
 # Streamlit Frontend
 #
-# This file is a UI layer only. It does not re-implement any
-# security logic — it calls straight into the existing backend:
-#   - database/database.py   (all persistence / SQL)
-#   - modules/security.py    (PBKDF2 password hashing)
-#   - modules/encryption.py  (AES-256-GCM message encryption)
-#   - modules/login_security.py        (branch lockout policy)
-#   - modules/admin_login_security.py  (admin lockout policy)
-#   - modules/register.py / admin_setup.py (password rules)
-#   - modules/login.py       (branch code validation)
+# This file is a UI layer only. Security rules live in the backend:
+#   - database/database.py, database/store.py   (persistence / SQL)
+#   - database/migrations.py                    (upgrades an existing bank.db)
+#   - modules/auth_service.py   (sign-in, lockout, 2FA step)
+#   - modules/two_factor.py, modules/totp.py    (TOTP authenticator codes)
+#   - modules/password_policy.py                (strength meter, change password)
+#   - modules/messaging_service.py              (encrypted subject/body, threads)
+#   - modules/encryption.py, key_management.py  (AES-256-GCM, key versions)
+#   - modules/audit_chain.py                    (tamper-evident audit log)
+#   - modules/alerts.py, analytics.py, reports.py  (admin monitoring)
+#   - modules/session_timeout.py                (inactivity limit)
 #
 # Run from the project root:
 #     streamlit run streamlit_app.py
@@ -19,10 +21,10 @@
 import html
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
+import pandas as pd
 import streamlit as st
-from cryptography.exceptions import InvalidTag
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))  # so "database/bank.db" etc. resolve
@@ -39,14 +41,8 @@ from database.database import (
     insert_branch,
     branch_exists,
     get_all_branches,
-    get_branch_by_code,
     get_branch_by_id,
     get_branch_profile,
-    save_message,
-    get_message_by_id,
-    get_messages_for_branch,
-    mark_message_as_read,
-    get_sent_messages_for_branch,
     log_activity,
     insert_admin,
     admin_exists,
@@ -61,24 +57,47 @@ from database.database import (
     log_admin_activity,
     get_activities_for_branch,
 )
+from database.migrations import run_migrations
+from database import store
 
-from modules.security import hash_password, verify_password
-from modules.encryption import encrypt_message, decrypt_message
+from modules.security import hash_password
+from modules.encryption import generate_encryption_key
 from modules.register import validate_password
 from modules.admin_setup import validate_admin_password
 from modules.login import validate_branch_code
-from modules.login_security import (
-    check_login_lock,
-    get_lock_remaining_time,
-    record_failed_attempt,
-    reset_login_attempts,
+
+from modules.auth_service import (
+    PENDING_2FA_SECONDS,
+    authenticate_branch,
+    complete_branch_2fa,
+    authenticate_admin,
+    complete_admin_2fa,
 )
-from modules.admin_login_security import (
-    check_admin_login_lock,
-    get_admin_lock_remaining_time,
-    record_admin_failed_attempt,
-    reset_admin_login_attempts,
+from modules import two_factor, totp, analytics, reports
+from modules import alerts as alert_engine
+from modules.password_policy import (
+    TEMP_PASSWORD_HOURS,
+    change_password,
+    force_password_change,
+    issue_temporary_password,
+    password_strength,
 )
+from modules.session_timeout import is_expired, SESSION_TIMEOUT_MINUTES
+from modules.messaging_service import (
+    MAX_BODY,
+    MAX_SUBJECT,
+    NO_SUBJECT,
+    PRIORITIES,
+    MessageIntegrityError,
+    MessagingError,
+    get_thread,
+    list_box,
+    open_message,
+    send_message,
+    set_status,
+)
+from modules.audit_chain import verify_all
+from modules.key_management import key_status, reencrypt_all_messages, rotate_key
 
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -97,6 +116,11 @@ def init_database():
     create_admins_table()
     create_admin_activity_logs_table()
     create_admin_login_security_table()
+    try:
+        generate_encryption_key()      # only creates a key if none exists
+    except Exception:
+        pass
+    run_migrations()
     return True
 
 
@@ -143,46 +167,49 @@ st.markdown(
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap');
 
+/* LIGHT THEME: change these variables to re-colour the whole app */
 :root{
-    --sb-navy-950:#070c17;
-    --sb-navy-900:#0a1223;
-    --sb-navy-800:#0f1b32;
-    --sb-navy-700:#152444;
-    --sb-navy-600:#1c2f56;
-    --sb-gold:#d4af37;
+    --sb-bg-1:#f7f9fd;          /* page background (top)     */
+    --sb-bg-2:#e9eff8;          /* page background (bottom)  */
+    --sb-panel:#ffffff;         /* cards, inputs             */
+    --sb-panel-soft:#f1f5fb;    /* message box, sidebar      */
+    --sb-line:#d5deec;          /* borders                   */
+    --sb-navy:#14213d;
+    --sb-gold:#c9a227;
     --sb-gold-soft:#e9cf7a;
-    --sb-text:#eef1f8;
-    --sb-text-dim:#9fb0cc;
-    --sb-green:#3ecf8e;
-    --sb-red:#ef6461;
-    --sb-amber:#f2b134;
+    --sb-gold-dark:#8a6d12;
+    --sb-text:#14213d;
+    --sb-text-dim:#5b6b88;
+    --sb-green:#12805a;
+    --sb-red:#c0392b;
+    --sb-amber:#9a6a00;
 }
 
 html, body, [class*="css"]  { font-family:'Inter', sans-serif; }
 
 .stApp {
     background:
-        radial-gradient(1200px 500px at 10% -10%, #142549 0%, transparent 60%),
-        radial-gradient(1000px 600px at 110% 10%, #16264a 0%, transparent 55%),
-        linear-gradient(180deg, var(--sb-navy-950) 0%, var(--sb-navy-900) 100%);
+        radial-gradient(1100px 480px at 8% -10%, #dfe9fb 0%, transparent 60%),
+        radial-gradient(900px 520px at 108% 8%, #f6ecd0 0%, transparent 55%),
+        linear-gradient(180deg, var(--sb-bg-1) 0%, var(--sb-bg-2) 100%);
     color: var(--sb-text);
 }
 
-h1, h2, h3 { font-family:'Playfair Display', serif !important; letter-spacing:.3px; }
+h1, h2, h3 { font-family:'Playfair Display', serif !important; letter-spacing:.3px; color: var(--sb-navy); }
 
 /* Sidebar */
 section[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, var(--sb-navy-950) 0%, #0c1730 100%);
-    border-right: 1px solid rgba(212,175,55,0.18);
+    background: linear-gradient(180deg, #ffffff 0%, var(--sb-panel-soft) 100%);
+    border-right: 1px solid var(--sb-line);
 }
 section[data-testid="stSidebar"] * { color: var(--sb-text) !important; }
 
 /* Cards */
 div[data-testid="stVerticalBlockBorderWrapper"] {
-    background: linear-gradient(180deg, rgba(21,36,68,0.65) 0%, rgba(15,27,50,0.65) 100%);
-    border: 1px solid rgba(212,175,55,0.22) !important;
+    background: var(--sb-panel);
+    border: 1px solid var(--sb-line) !important;
     border-radius: 16px !important;
-    box-shadow: 0 8px 30px rgba(0,0,0,0.35);
+    box-shadow: 0 6px 22px rgba(20,33,61,0.08);
 }
 
 /* Buttons */
@@ -194,37 +221,45 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     font-weight: 700;
     padding: 0.55em 1.4em;
     transition: all .15s ease;
-    box-shadow: 0 4px 14px rgba(212,175,55,0.25);
+    box-shadow: 0 4px 12px rgba(201,162,39,0.28);
 }
 .stButton>button:hover, .stFormSubmitButton>button:hover {
     transform: translateY(-1px);
-    box-shadow: 0 8px 20px rgba(212,175,55,0.35);
+    box-shadow: 0 8px 18px rgba(201,162,39,0.38);
     color: #1a1204;
+}
+.stButton>button:disabled, .stFormSubmitButton>button:disabled {
+    background: #e3e8f1; color: #8e9bb3; box-shadow: none; transform: none;
 }
 .stButton>button[kind="secondary"]{
     background: transparent;
-    color: var(--sb-gold-soft) !important;
-    border: 1px solid rgba(212,175,55,0.5);
+    color: var(--sb-gold-dark) !important;
+    border: 1px solid var(--sb-gold);
     box-shadow:none;
 }
 
 /* Inputs */
-.stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] > div {
-    background: rgba(7,12,23,0.65) !important;
+.stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"] > div,
+.stDateInput input, .stNumberInput input {
+    background: var(--sb-panel) !important;
     color: var(--sb-text) !important;
-    border: 1px solid rgba(159,176,204,0.25) !important;
+    border: 1px solid var(--sb-line) !important;
     border-radius: 10px !important;
+}
+.stTextInput input:focus, .stTextArea textarea:focus {
+    border-color: var(--sb-gold) !important;
+    box-shadow: 0 0 0 1px var(--sb-gold) !important;
 }
 
 /* Tabs */
-.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid rgba(212,175,55,0.2); }
+.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid var(--sb-line); }
 .stTabs [data-baseweb="tab"] {
     color: var(--sb-text-dim);
     font-weight: 600;
     padding: 10px 18px;
 }
 .stTabs [aria-selected="true"] {
-    color: var(--sb-gold-soft) !important;
+    color: var(--sb-gold-dark) !important;
     border-bottom: 2px solid var(--sb-gold) !important;
 }
 
@@ -232,23 +267,23 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 .sb-hero {
     padding: 46px 42px;
     border-radius: 22px;
-    background: linear-gradient(135deg, rgba(21,36,68,0.9) 0%, rgba(10,18,35,0.9) 100%);
-    border: 1px solid rgba(212,175,55,0.28);
-    box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+    background: linear-gradient(135deg, #ffffff 0%, #eef3fc 100%);
+    border: 1px solid var(--sb-line);
+    box-shadow: 0 16px 44px rgba(20,33,61,0.10);
     margin-bottom: 28px;
 }
 .sb-eyebrow {
     display:inline-block;
     letter-spacing: 3px;
     font-size: 12px;
-    color: var(--sb-gold-soft);
+    color: var(--sb-gold-dark);
     text-transform: uppercase;
-    border: 1px solid rgba(212,175,55,0.4);
+    border: 1px solid var(--sb-gold);
     border-radius: 999px;
     padding: 5px 14px;
     margin-bottom: 16px;
 }
-.sb-hero h1 { font-size: 44px; margin: 0 0 6px 0; color: var(--sb-text); }
+.sb-hero h1 { font-size: 44px; margin: 0 0 6px 0; color: var(--sb-navy); }
 .sb-hero p.sub { color: var(--sb-text-dim); font-size: 17px; max-width: 620px; }
 
 /* Badges */
@@ -256,29 +291,31 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     display:inline-block; padding: 3px 12px; border-radius: 999px;
     font-size: 12px; font-weight: 700; letter-spacing: .4px;
 }
-.sb-badge-success { background: rgba(62,207,142,0.15); color: var(--sb-green); border:1px solid rgba(62,207,142,0.35);}
-.sb-badge-warning  { background: rgba(242,177,52,0.15); color: var(--sb-amber); border:1px solid rgba(242,177,52,0.35);}
-.sb-badge-danger  { background: rgba(239,100,97,0.15); color: var(--sb-red); border:1px solid rgba(239,100,97,0.35);}
-.sb-badge-neutral { background: rgba(159,176,204,0.15); color: var(--sb-text-dim); border:1px solid rgba(159,176,204,0.3);}
+.sb-badge-success { background: rgba(18,128,90,0.10); color: var(--sb-green); border:1px solid rgba(18,128,90,0.40);}
+.sb-badge-warning  { background: rgba(154,106,0,0.10); color: var(--sb-amber); border:1px solid rgba(154,106,0,0.40);}
+.sb-badge-danger  { background: rgba(192,57,43,0.10); color: var(--sb-red); border:1px solid rgba(192,57,43,0.40);}
+.sb-badge-neutral { background: rgba(91,107,136,0.10); color: var(--sb-text-dim); border:1px solid rgba(91,107,136,0.35);}
 
 /* Message bubble */
 .sb-message-box {
-    background: rgba(7,12,23,0.55);
-    border: 1px solid rgba(212,175,55,0.25);
+    background: var(--sb-panel-soft);
+    border: 1px solid var(--sb-line);
+    border-left: 4px solid var(--sb-gold);
     border-radius: 14px;
     padding: 18px 20px;
     font-size: 15.5px;
     line-height: 1.55;
+    color: var(--sb-text);
     white-space: pre-wrap;
 }
 
-.sb-divider { height:1px; background: linear-gradient(90deg, transparent, rgba(212,175,55,0.4), transparent); margin: 18px 0; border:none;}
+.sb-divider { height:1px; background: linear-gradient(90deg, transparent, var(--sb-line), transparent); margin: 18px 0; border:none;}
 
 .sb-footnote { color: var(--sb-text-dim); font-size: 13px; }
 
 /* Metric-like small stat */
 .sb-stat { text-align:center; padding: 10px 0; }
-.sb-stat .n { font-family:'Playfair Display', serif; font-size: 30px; color: var(--sb-gold-soft); font-weight:700;}
+.sb-stat .n { font-family:'Playfair Display', serif; font-size: 30px; color: var(--sb-gold-dark); font-weight:700;}
 .sb-stat .l { color: var(--sb-text-dim); font-size: 12.5px; letter-spacing:1px; text-transform:uppercase;}
 
 table { color: var(--sb-text) !important; }
@@ -296,9 +333,13 @@ defaults = {
     "page": "home",
     "branch_session": None,
     "admin_session": None,
-    "branch_read_logged": set(),
     "profile_logged_this_session": False,
+    "pending_2fa": None,       # password accepted, waiting for the 2FA code
+    "view_msg": None,          # message currently opened in the detail view
+    "form_nonce": 0,           # changing it gives widgets fresh (empty) keys
+    "flash": None,             # (level, text) shown once on the next run
 }
+
 for key, value in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = value
@@ -306,6 +347,313 @@ for key, value in defaults.items():
 
 def go(page):
     st.session_state["page"] = page
+
+
+def flash(level, text):
+    """Show a message once after the next st.rerun()."""
+    st.session_state["flash"] = (level, text)
+
+
+def show_flash():
+    item = st.session_state["flash"]
+    if item:
+        level, text = item
+        getattr(st, level)(text)
+        st.session_state["flash"] = None
+
+
+def bump_nonce():
+    """Clears every nonce-keyed input (passwords etc.) on the next run."""
+    st.session_state["form_nonce"] += 1
+
+
+def nk(name):
+    return f"{name}_{st.session_state['form_nonce']}"
+
+
+# =============================================================
+# SESSIONS: START, END, INACTIVITY TIMEOUT
+# =============================================================
+
+def start_branch_session(result):
+    now = datetime.now()
+    st.session_state["branch_session"] = {
+        "branch_id": result.account_id,
+        "branch_code": branch_code_fmt(result.account_id),
+        "branch_name": result.account_name,
+        "login_time": now.strftime(DATETIME_FORMAT),
+        "last_activity": now,
+        "must_change_password": result.must_change_password,
+    }
+    st.session_state["profile_logged_this_session"] = False
+    st.session_state["view_msg"] = None
+    st.session_state["pending_2fa"] = None
+
+
+def start_admin_session(result):
+    now = datetime.now()
+    st.session_state["admin_session"] = {
+        "admin_id": result.account_id,
+        "username": result.account_name,
+        "login_time": now.strftime(DATETIME_FORMAT),
+        "last_activity": now,
+        "must_change_password": result.must_change_password,
+    }
+    st.session_state["pending_2fa"] = None
+
+
+def end_session(kind, event, description):
+    """Writes the audit entry and clears the session."""
+    if kind == "branch":
+        session = st.session_state["branch_session"]
+        if session:
+            log_activity(session["branch_id"], event, description, now_str())
+        st.session_state["branch_session"] = None
+        st.session_state["profile_logged_this_session"] = False
+        st.session_state["view_msg"] = None
+    else:
+        session = st.session_state["admin_session"]
+        if session:
+            log_admin_activity(session["admin_id"], event, description,
+                               now_str())
+        st.session_state["admin_session"] = None
+
+
+def enforce_session_timeouts():
+    """Runs at the top of every script run. Any interaction counts as
+    activity; a session idle for longer than the limit is closed (and
+    logged) before anything is shown."""
+
+    now = datetime.now()
+
+    for kind, key, event in (
+        ("branch", "branch_session", "SESSION_TIMEOUT"),
+        ("admin", "admin_session", "ADMIN_SESSION_TIMEOUT"),
+    ):
+        session = st.session_state[key]
+        if session is None:
+            continue
+
+        if is_expired(session["last_activity"], now):
+            end_session(
+                kind, event,
+                f"Signed out automatically after {SESSION_TIMEOUT_MINUTES} "
+                "minutes of inactivity",
+            )
+            flash(
+                "warning",
+                f"You were signed out after {SESSION_TIMEOUT_MINUTES} "
+                "minutes of inactivity. Please sign in again.",
+            )
+        else:
+            session["last_activity"] = now
+
+    pending = st.session_state["pending_2fa"]
+    if pending and (now - pending["started"]).total_seconds() \
+            > PENDING_2FA_SECONDS:
+        st.session_state["pending_2fa"] = None
+        flash("warning", "The verification step timed out. "
+                         "Please sign in again.")
+
+
+enforce_session_timeouts()
+
+
+# =============================================================
+# SHARED UI COMPONENTS
+# =============================================================
+
+def strength_meter(password, context_words=()):
+    info = password_strength(password, context_words)
+    st.progress(info["score"] / 4,
+                text=f"Password strength: {info['label']}")
+    columns = st.columns(2)
+    for index, (text, passed) in enumerate(info["rules"]):
+        columns[index % 2].caption(("\u2705 " if passed else "\u2B1C ") + text)
+    for hint in info["feedback"]:
+        st.caption("\U0001F4A1 " + hint)
+    return info
+
+
+def show_auth_failure(result):
+    if result.status == "LOCKED":
+        st.error(
+            f"{result.message}\n\n"
+            f"Try again in approximately "
+            f"{fmt_lock_wait(result.remaining_seconds)}.\n\n"
+            "Maximum failed attempts: 3 \u00B7 Lockout duration: 5 minutes."
+        )
+    else:
+        st.error(result.message)
+
+
+def render_2fa_challenge(pending):
+    """Second login step: the 6-digit code from the authenticator app."""
+
+    with st.container(border=True):
+        st.markdown("#### \U0001F510 Two-Factor Verification")
+        st.caption(
+            f"Signing in as **{pending['label']}**. Open your authenticator "
+            "app and enter the current 6-digit code."
+        )
+        with st.form("two_factor_form", clear_on_submit=True):
+            code = st.text_input("Authentication code", max_chars=6,
+                                 placeholder="123456")
+            col_a, col_b = st.columns(2)
+            verify = col_a.form_submit_button("Verify & Sign In",
+                                              use_container_width=True)
+            cancel = col_b.form_submit_button("Cancel",
+                                              use_container_width=True)
+
+    if cancel:
+        st.session_state["pending_2fa"] = None
+        st.rerun()
+
+    if verify:
+        code = code.strip()
+        if pending["kind"] == "branch":
+            result = complete_branch_2fa(pending["account_id"], code,
+                                         pending["name"])
+        else:
+            result = complete_admin_2fa(pending["account_id"], code,
+                                        pending["name"])
+
+        if result.ok:
+            if pending["kind"] == "branch":
+                start_branch_session(result)
+            else:
+                start_admin_session(result)
+            st.rerun()
+        else:
+            if result.status == "LOCKED":
+                st.session_state["pending_2fa"] = None
+            show_auth_failure(result)
+
+
+def render_change_password(kind, account_id, name):
+    """Change-password card (also used for the forced change)."""
+
+    with st.container(border=True):
+        st.markdown("#### \U0001F511 Change Password")
+        current = st.text_input("Current password", type="password",
+                                key=nk(f"{kind}_cp_current"))
+        new = st.text_input("New password", type="password",
+                            key=nk(f"{kind}_cp_new"))
+        strength_meter(new, context_words=(name,))
+        confirm = st.text_input("Confirm new password", type="password",
+                                key=nk(f"{kind}_cp_confirm"))
+
+        if st.button("Update Password", use_container_width=True,
+                     key=nk(f"{kind}_cp_button")):
+            ok, message = change_password(kind, account_id, current, new,
+                                          confirm)
+            if ok:
+                session_key = "branch_session" if kind == "branch" \
+                    else "admin_session"
+                st.session_state[session_key]["must_change_password"] = False
+                bump_nonce()
+                flash("success", message)
+                st.rerun()
+            else:
+                st.error(message)
+
+
+def render_two_factor_panel(kind, account_id, label):
+    """Enable / disable authenticator-app (TOTP) two-factor login."""
+
+    with st.container(border=True):
+        st.markdown("#### \U0001F6E1\uFE0F Two-Factor Authentication (TOTP)")
+
+        # ---- already enabled -----------------------------------
+        if two_factor.is_enabled(kind, account_id):
+            st.markdown(badge("2FA ENABLED", "success"),
+                        unsafe_allow_html=True)
+            st.caption(
+                "To turn it off, confirm your password and a current "
+                "authenticator code."
+            )
+            with st.form(f"{kind}_2fa_disable_form", clear_on_submit=True):
+                password = st.text_input("Password", type="password")
+                code = st.text_input("Current authentication code",
+                                     max_chars=6)
+                disable_clicked = st.form_submit_button(
+                    "Disable Two-Factor Authentication",
+                    use_container_width=True)
+            if disable_clicked:
+                ok, message = two_factor.disable(kind, account_id, password,
+                                                 code.strip())
+                if ok:
+                    flash("success", message)
+                    st.rerun()
+                else:
+                    st.error(message)
+            return
+
+        # ---- enrolment started, waiting for the first code -------
+        secret = two_factor.get_pending_secret(kind, account_id)
+
+        if secret is None:
+            st.markdown(badge("2FA OFF", "warning"), unsafe_allow_html=True)
+            st.caption(
+                "Add a second step to sign-in: a 6-digit code from an "
+                "authenticator app (Google Authenticator, Microsoft "
+                "Authenticator, Authy)."
+            )
+            if st.button("Set Up Two-Factor Authentication",
+                         key=f"{kind}_2fa_start", use_container_width=True):
+                two_factor.start_enrollment(kind, account_id)
+                st.rerun()
+            return
+
+        uri = totp.provisioning_uri(secret, label)
+        qr = totp.qr_png_bytes(uri)
+        col_qr, col_key = st.columns([1, 2])
+
+        if qr:
+            col_qr.image(qr, caption="Scan with your authenticator app",
+                         width=200)
+        else:
+            col_qr.info("QR image unavailable (optional package "
+                        "`qrcode[pil]` is not installed). Use the key.")
+
+        col_key.markdown("Can't scan? Enter this key manually "
+                         "(time-based, 6 digits):")
+        col_key.code(secret, language=None)
+        col_key.caption("Then enter the code the app shows to finish.")
+
+        with st.form(f"{kind}_2fa_confirm_form", clear_on_submit=True):
+            code = st.text_input("Code from the app", max_chars=6,
+                                 placeholder="123456")
+            col_a, col_b = st.columns(2)
+            confirm_clicked = col_a.form_submit_button(
+                "Confirm & Enable", use_container_width=True)
+            cancel_clicked = col_b.form_submit_button(
+                "Cancel Setup", use_container_width=True)
+
+        if cancel_clicked:
+            two_factor.cancel_enrollment(kind, account_id)
+            st.rerun()
+
+        if confirm_clicked:
+            if two_factor.confirm_enrollment(kind, account_id, code.strip()):
+                flash("success", "Two-factor authentication is now enabled.")
+                st.rerun()
+            else:
+                st.error("That code is not correct. Check the time on your "
+                         "phone and try again.")
+
+
+def priority_badge(priority):
+    kind = {"URGENT": "danger", "CONFIDENTIAL": "warning"}.get(priority,
+                                                               "neutral")
+    return badge(priority, kind)
+
+
+def branch_display(branch_id):
+    branch = get_branch_by_id(branch_id)
+    if branch is None:
+        return branch_code_fmt(branch_id)
+    return f"{branch[1]} ({branch_code_fmt(branch_id)})"
 
 
 # =============================================================
@@ -316,8 +664,8 @@ with st.sidebar:
     st.markdown(
         "<div style='text-align:center;padding:6px 0 2px 0;'>"
         "<span style='font-size:38px;'>\U0001F3E6</span>"
-        "<h2 style='margin:6px 0 0 0;color:#eef1f8;'>SECURE BANK</h2>"
-        "<div style='color:#d4af37;letter-spacing:2px;font-size:12px;'>BRANCH NETWORK SYSTEM</div>"
+        "<h2 style='margin:6px 0 0 0;color:var(--sb-text);'>SECURE BANK</h2>"
+        "<div style='color:var(--sb-gold-dark);letter-spacing:2px;font-size:12px;'>BRANCH NETWORK SYSTEM</div>"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -337,13 +685,22 @@ with st.sidebar:
         b = st.session_state["branch_session"]
         st.markdown(f"**Branch signed in**  \n{b['branch_name']} ({b['branch_code']})")
         st.caption(f"Login time: {b['login_time']}")
+
     if st.session_state["admin_session"]:
         a = st.session_state["admin_session"]
         st.markdown(f"**Admin signed in**  \n{a['username']}")
+        st.caption(f"Login time: {a['login_time']}")
+
+    if st.session_state["branch_session"] or st.session_state["admin_session"]:
+        st.caption(f"Auto sign-out after {SESSION_TIMEOUT_MINUTES} minutes "
+                   "of inactivity")
 
     st.markdown("<hr class='sb-divider'/>", unsafe_allow_html=True)
-    st.caption("AES-256-GCM encrypted messaging")
+    st.caption("AES-256-GCM encrypted messaging (versioned keys)")
     st.caption("PBKDF2-SHA256 (600,000 iterations) password hashing")
+    st.caption("Optional TOTP two-factor authentication")
+    st.caption("Admin-issued temporary password recovery")
+    st.caption("Tamper-evident audit log (HMAC chain)")
     st.caption("Automatic lockout after 3 failed attempts")
 
 
@@ -424,110 +781,333 @@ def render_home():
 # BRANCH PORTAL — AUTH
 # =============================================================
 
+def render_branch_login_form():
+    with st.container(border=True):
+        st.markdown("#### Branch Sign In")
+        with st.form("branch_login_form", clear_on_submit=True):
+            branch_code_input = st.text_input("Branch Code", placeholder="e.g. SB001").strip().upper()
+            password_input = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In", use_container_width=True)
+
+        if submitted:
+            result = authenticate_branch(branch_code_input, password_input)
+
+            if result.ok:
+                start_branch_session(result)
+                st.rerun()
+            elif result.status == "NEEDS_2FA":
+                st.session_state["pending_2fa"] = {
+                    "kind": "branch",
+                    "account_id": result.account_id,
+                    "name": result.account_name,
+                    "label": f"{result.account_name} ({branch_code_fmt(result.account_id)})",
+                    "started": datetime.now(),
+                }
+                st.rerun()
+            else:
+                show_auth_failure(result)
+
+        st.caption(
+            "\U0001F511 Forgot your password? Contact your administrator: they can issue a "
+            "temporary password that you must change at your next sign-in."
+        )
+
+
+def render_branch_register():
+    with st.container(border=True):
+        st.markdown("#### Register a New Branch")
+        st.caption(
+            "Password must be at least 10 characters and include an uppercase letter, "
+            "a lowercase letter, a digit, and a special character."
+        )
+
+        branch_name_input = st.text_input("Branch Name", placeholder="e.g. Bangalore", key=nk("reg_name"))
+        new_password = st.text_input("Password", type="password", key=nk("reg_password"))
+        strength_meter(new_password, context_words=(branch_name_input,))
+        confirm_password = st.text_input("Confirm Password", type="password", key=nk("reg_confirm"))
+
+        if st.button("Register Branch", use_container_width=True, key=nk("reg_button")):
+            name = branch_name_input.strip()
+
+            if name == "":
+                st.error("Branch name cannot be empty.")
+            elif len(name) < 3:
+                st.error("Branch name must contain at least 3 characters.")
+            elif len(name) > 50:
+                st.error("Branch name cannot exceed 50 characters.")
+            elif branch_exists(name):
+                st.error(f"Branch '{name}' already exists. Please choose a different name.")
+            elif not validate_password(new_password):
+                st.error(
+                    "Password does not meet security requirements: at least 10 characters, "
+                    "one uppercase, one lowercase, one digit, one special character, "
+                    "and not a common weak password."
+                )
+            elif new_password != confirm_password:
+                st.error("Passwords do not match.")
+            else:
+                password_hash, password_salt = hash_password(new_password)
+                branch_id = insert_branch(name, password_hash, password_salt, now_str())
+                code = branch_code_fmt(branch_id)
+                bump_nonce()
+
+                st.success("Registration successful!")
+                with st.container(border=True):
+                    st.markdown(f"**Branch ID**  \n{branch_id}")
+                    st.markdown(f"**Branch Code**  \n`{code}`")
+                    st.markdown(f"**Branch Name**  \n{name}")
+                st.info("Save your branch code — you'll need it to sign in. "
+                        "You can enable two-factor authentication from "
+                        "Profile & Security after signing in.")
+
+
 def render_branch_auth():
     st.markdown("## \U0001F3E6 Branch Portal")
+
     tab_login, tab_register = st.tabs(["Sign In", "Register New Branch"])
 
     with tab_login:
-        with st.container(border=True):
-            st.markdown("#### Branch Sign In")
-            with st.form("branch_login_form", clear_on_submit=True):
-                branch_code_input = st.text_input("Branch Code", placeholder="e.g. SB001").strip().upper()
-                password_input = st.text_input("Password", type="password")
-                submitted = st.form_submit_button("Sign In", use_container_width=True)
-
-            if submitted:
-                if not validate_branch_code(branch_code_input):
-                    st.error("Invalid branch code. Expected format: SB001")
-                else:
-                    branch = get_branch_by_code(branch_code_input)
-                    if branch is None:
-                        st.error("Branch does not exist. Please check your branch code.")
-                    else:
-                        branch_id, branch_name, password_hash, password_salt = branch
-
-                        if check_login_lock(branch_id):
-                            remaining = get_lock_remaining_time(branch_id)
-                            if remaining > 0:
-                                st.error(
-                                    f"Account temporarily locked. Too many failed login attempts.\n\n"
-                                    f"Try again in approximately {fmt_lock_wait(remaining)}.\n\n"
-                                    f"Maximum failed attempts: 3 · Lockout duration: 5 minutes."
-                                )
-                                st.stop()
-
-                        if password_input == "":
-                            st.error("Password cannot be empty.")
-                        elif verify_password(password_input, password_hash, password_salt):
-                            reset_login_attempts(branch_id)
-                            login_time = now_str()
-                            st.session_state["branch_session"] = {
-                                "branch_id": branch_id,
-                                "branch_code": branch_code_input,
-                                "branch_name": branch_name,
-                                "login_time": login_time,
-                            }
-                            st.session_state["branch_read_logged"] = set()
-                            st.session_state["profile_logged_this_session"] = False
-                            log_activity(branch_id, "LOGIN", "Branch logged in", login_time)
-                            st.success("Login successful. Loading your dashboard...")
-                            st.rerun()
-                        else:
-                            failed_attempts = record_failed_attempt(branch_id)
-                            log_activity(branch_id, "FAILED_LOGIN", "Incorrect password", now_str())
-                            if failed_attempts >= 3:
-                                st.error(
-                                    f"Incorrect password. Failed attempts: {failed_attempts}/3.\n\n"
-                                    "Account has been temporarily locked. Please try again after 5 minutes."
-                                )
-                            else:
-                                st.error(
-                                    f"Incorrect password. Failed attempts: {failed_attempts}/3. "
-                                    f"Remaining attempts: {3 - failed_attempts}."
-                                )
+        pending = st.session_state["pending_2fa"]
+        if pending and pending["kind"] == "branch":
+            render_2fa_challenge(pending)
+        else:
+            render_branch_login_form()
 
     with tab_register:
-        with st.container(border=True):
-            st.markdown("#### Register a New Branch")
-            st.caption(
-                "Password must be at least 10 characters and include an uppercase letter, "
-                "a lowercase letter, a digit, and a special character."
-            )
-            with st.form("branch_register_form", clear_on_submit=True):
-                branch_name_input = st.text_input("Branch Name", placeholder="e.g. Bangalore")
-                new_password = st.text_input("Password", type="password")
-                confirm_password = st.text_input("Confirm Password", type="password")
-                submitted = st.form_submit_button("Register Branch", use_container_width=True)
+        render_branch_register()
 
-            if submitted:
-                name = branch_name_input.strip()
-                if name == "":
-                    st.error("Branch name cannot be empty.")
-                elif len(name) < 3:
-                    st.error("Branch name must contain at least 3 characters.")
-                elif len(name) > 50:
-                    st.error("Branch name cannot exceed 50 characters.")
-                elif branch_exists(name):
-                    st.error(f"Branch '{name}' already exists. Please choose a different name.")
-                elif not validate_password(new_password):
-                    st.error(
-                        "Password does not meet security requirements: at least 10 characters, "
-                        "one uppercase, one lowercase, one digit, one special character, "
-                        "and not a common weak password."
-                    )
-                elif new_password != confirm_password:
-                    st.error("Passwords do not match.")
-                else:
-                    password_hash, password_salt = hash_password(new_password)
-                    created_date = now_str()
-                    branch_id = insert_branch(name, password_hash, password_salt, created_date)
-                    code = branch_code_fmt(branch_id)
-                    st.success("Registration successful!")
-                    with st.container(border=True):
-                        st.markdown(f"**Branch ID**  \n{branch_id}")
-                        st.markdown(f"**Branch Code**  \n`{code}`")
-                        st.markdown(f"**Branch Name**  \n{name}")
-                    st.info("Save your branch code — you'll need it to sign in.")
+
+# =============================================================
+# BRANCH PORTAL — MESSAGING
+# =============================================================
+
+def render_message_detail(branch_id, message_id, box, status, prefix):
+    """One opened message: body, conversation, reply and actions."""
+
+    if st.button("\u2190 Back to list", key=f"{prefix}_back"):
+        st.session_state["view_msg"] = None
+        st.rerun()
+
+    try:
+        message = open_message(message_id, branch_id)
+    except MessageIntegrityError:
+        st.error("Unable to decrypt this message. It may have been modified or corrupted.")
+        return
+    except (MessagingError, PermissionError) as error:
+        st.error(str(error))
+        return
+
+    sender_id = message["sender_branch_id"]
+    receiver_id = message["receiver_branch_id"]
+    is_receiver = receiver_id == branch_id
+    other_id = sender_id if is_receiver else receiver_id
+
+    with st.container(border=True):
+        st.markdown(
+            f"<h4 style='margin-bottom:4px;'>{html.escape(message['subject'])}</h4>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"{'From' if is_receiver else 'To'} **{html.escape(branch_display(other_id))}** "
+            f"\u00B7 <span class='sb-footnote'>{message['sent_date']}</span> "
+            f"{priority_badge(message['priority'])}",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div class='sb-message-box'>{html.escape(message['body'])}</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(f"Encrypted with key version {message['key_id']} (AES-256-GCM)")
+
+    # ---- conversation ------------------------------------------
+    try:
+        thread = get_thread(message_id, branch_id)
+    except (MessagingError, PermissionError):
+        thread = []
+
+    if len(thread) > 1:
+        with st.expander(f"Conversation ({len(thread)} messages)"):
+            for item in thread:
+                who = "You" if item["direction"] == "sent" else branch_display(item["sender_branch_id"])
+                st.markdown(
+                    f"**{html.escape(who)}** \u00B7 "
+                    f"<span class='sb-footnote'>{item['sent_date']}</span>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    f"<div class='sb-message-box'>{html.escape(item['body'])}</div>",
+                    unsafe_allow_html=True,
+                )
+
+    # ---- reply (only to a message you received) -----------------
+    if is_receiver:
+        with st.form(f"{prefix}_reply_form", clear_on_submit=True):
+            st.markdown("##### Reply")
+            reply_text = st.text_area("Your reply", max_chars=MAX_BODY, height=110,
+                                      placeholder=f"Type your reply (max {MAX_BODY} characters)...")
+            reply_priority = st.selectbox("Priority", list(PRIORITIES))
+            send_reply = st.form_submit_button("Encrypt & Send Reply", use_container_width=True)
+
+        if send_reply:
+            original = message["subject"]
+            if original == NO_SUBJECT:
+                reply_subject = ""
+            elif original.lower().startswith("re:"):
+                reply_subject = original
+            else:
+                reply_subject = f"Re: {original}"[:MAX_SUBJECT]
+
+            try:
+                new_id = send_message(branch_id, other_id, reply_text,
+                                      subject=reply_subject, priority=reply_priority,
+                                      parent_id=message_id)
+            except MessagingError as error:
+                st.error(str(error))
+            else:
+                flash("success", f"Reply #{new_id} sent securely to {branch_display(other_id)}.")
+                st.rerun()
+
+    # ---- archive / delete / restore -----------------------------
+    st.markdown("##### Manage")
+    col_a, col_b, col_c = st.columns(3)
+
+    if status == "ACTIVE":
+        if col_a.button("\U0001F5C4\uFE0F Archive", key=f"{prefix}_archive", use_container_width=True):
+            set_status(message_id, branch_id, "ARCHIVED")
+            st.session_state["view_msg"] = None
+            flash("success", f"Message #{message_id} archived.")
+            st.rerun()
+    else:
+        if col_a.button("\u21A9\uFE0F Restore", key=f"{prefix}_restore", use_container_width=True):
+            set_status(message_id, branch_id, "ACTIVE")
+            st.session_state["view_msg"] = None
+            flash("success", f"Message #{message_id} restored.")
+            st.rerun()
+
+    confirm_delete = col_c.checkbox("Confirm delete", key=f"{prefix}_confirm_delete")
+    if col_b.button("\U0001F5D1\uFE0F Delete", key=f"{prefix}_delete",
+                    disabled=not confirm_delete, use_container_width=True):
+        set_status(message_id, branch_id, "DELETED")
+        st.session_state["view_msg"] = None
+        flash("success", f"Message #{message_id} deleted from your view.")
+        st.rerun()
+
+    st.caption("Deleting removes the message from your mailbox only. The other branch "
+               "keeps its copy and the record is retained for auditing.")
+
+
+def render_message_box(branch_id, box, status, prefix, title):
+    """List (with search & filters) or, when one is opened, its detail."""
+
+    view = st.session_state["view_msg"]
+    if view and view["box"] == prefix:
+        render_message_detail(branch_id, view["id"], box, status, prefix)
+        return
+
+    other_label_text = "From" if box == "inbox" else "To"
+    other_options = {"All branches": None}
+    for (bid, bname, _created) in get_all_branches():
+        if bid != branch_id:
+            other_options[f"{bname} ({branch_code_fmt(bid)})"] = bid
+
+    with st.expander("\U0001F50E Search & filter"):
+        col_a, col_b, col_c = st.columns([3, 2, 2])
+        keyword = col_a.text_input("Search subject or text", key=f"{prefix}_keyword")
+        priority_choice = col_b.selectbox("Priority", ["All", *PRIORITIES], key=f"{prefix}_priority")
+        if box == "inbox":
+            unread_only = col_c.checkbox("Unread only", key=f"{prefix}_unread")
+        else:
+            unread_only = False
+
+        col_d, col_e = st.columns(2)
+        other_choice = col_d.selectbox(other_label_text, list(other_options), key=f"{prefix}_other")
+        use_dates = col_e.checkbox("Filter by date", key=f"{prefix}_use_dates")
+
+        date_from = date_to = None
+        if use_dates:
+            col_f, col_g = st.columns(2)
+            date_from = col_f.date_input("From date", value=date.today() - timedelta(days=30),
+                                         key=f"{prefix}_date_from")
+            date_to = col_g.date_input("To date", value=date.today(), key=f"{prefix}_date_to")
+
+    rows = list_box(
+        branch_id, box, status=status,
+        keyword=keyword,
+        priority=None if priority_choice == "All" else priority_choice,
+        other_branch_id=other_options[other_choice],
+        date_from=date_from, date_to=date_to,
+        unread_only=unread_only,
+    )
+
+    unread = sum(1 for r in rows if r["is_read"] == 0) if box == "inbox" else 0
+    st.markdown(f"#### {title} ({len(rows)})" + (f" \u00B7 {unread} unread" if unread else ""))
+
+    if not rows:
+        st.info("No messages found.")
+        return
+
+    for row in rows:
+        with st.container(border=True):
+            top = st.columns([5, 3, 3])
+            direction = "From" if box == "inbox" else "To"
+            top[0].markdown(
+                f"**#{row['message_id']} \u00B7 {html.escape(row['subject'])}**  \n"
+                f"<span class='sb-footnote'>{direction} {html.escape(branch_display(row['other_branch_id']))}</span>",
+                unsafe_allow_html=True,
+            )
+            top[1].markdown(f"<span class='sb-footnote'>{row['sent_date']}</span>", unsafe_allow_html=True)
+
+            badges = priority_badge(row["priority"])
+            if not row["intact"]:
+                badges += " " + badge("INTEGRITY FAILED", "danger")
+            elif box == "inbox":
+                badges += " " + (badge("READ", "neutral") if row["is_read"] == 1 else badge("NEW", "success"))
+            else:
+                badges += " " + (badge("READ", "success") if row["is_read"] == 1 else badge("UNREAD", "warning"))
+            top[2].markdown(badges, unsafe_allow_html=True)
+
+            if row["parent_message_id"]:
+                st.caption(f"Reply to #{row['parent_message_id']}")
+
+            if st.button("Decrypt & View", key=f"{prefix}_open_{row['message_id']}"):
+                st.session_state["view_msg"] = {"box": prefix, "id": row["message_id"]}
+                st.rerun()
+
+
+def render_send_message(branch_id):
+    with st.container(border=True):
+        st.markdown("#### Send a Secure Message")
+
+        other_branches = [
+            (bid, bname) for (bid, bname, _created) in get_all_branches() if bid != branch_id
+        ]
+
+        if not other_branches:
+            st.info("No other branches are available to message yet.")
+            return
+
+        options = {f"{name} ({branch_code_fmt(bid)})": bid for (bid, name) in other_branches}
+
+        with st.form("send_message_form", clear_on_submit=True):
+            receiver_label = st.selectbox("Receiver Branch", list(options.keys()))
+            col_a, col_b = st.columns([3, 1])
+            subject = col_a.text_input("Subject", max_chars=MAX_SUBJECT, placeholder="Short subject (optional)")
+            priority = col_b.selectbox("Priority", list(PRIORITIES))
+            message_text = st.text_area("Message", max_chars=MAX_BODY, height=140,
+                                        placeholder=f"Type your secure message (max {MAX_BODY} characters)...")
+            submitted = st.form_submit_button("Encrypt & Send", use_container_width=True)
+
+        if submitted:
+            try:
+                message_id = send_message(branch_id, options[receiver_label], message_text,
+                                          subject=subject, priority=priority)
+            except MessagingError as error:
+                st.error(str(error))
+            else:
+                st.success(
+                    f"Message #{message_id} sent securely to {receiver_label}. "
+                    "Subject and text were encrypted with AES-256-GCM before being stored."
+                )
 
 
 # =============================================================
@@ -539,130 +1119,52 @@ def render_branch_dashboard():
     branch_id = session["branch_id"]
 
     st.markdown(f"## \U0001F3E6 Welcome, {session['branch_name']} Branch")
-    st.caption(f"Branch Code: `{session['branch_code']}` · Signed in at {session['login_time']}")
+    st.caption(f"Branch Code: `{session['branch_code']}` \u00B7 Signed in at {session['login_time']}")
 
-    tabs = st.tabs(["\U0001F4E4 Send Message", "\U0001F4E5 Inbox", "\U0001F4EC Sent Messages", "\U0001F464 Profile", "\U0001F4CB Activity History", "\U0001F6AA Logout"])
+    # An administrator can require a new password before anything else
+    if session.get("must_change_password"):
+        st.warning(
+            "An administrator requires you to choose a new password before you continue. "
+            "If you were given a temporary password, enter it as the current password."
+        )
+        render_change_password("branch", branch_id, session["branch_name"])
+        if st.button("Sign out", key="forced_branch_logout"):
+            end_session("branch", "LOGOUT", "Branch logged out")
+            st.rerun()
+        return
 
-    # --------------------------------------------------
-    # SEND MESSAGE
-    # --------------------------------------------------
+    tabs = st.tabs([
+        "\U0001F4E4 Send Message",
+        "\U0001F4E5 Inbox",
+        "\U0001F4EC Sent",
+        "\U0001F5C4\uFE0F Archive",
+        "\U0001F464 Profile & Security",
+        "\U0001F4CB Activity History",
+        "\U0001F6AA Logout",
+    ])
+
     with tabs[0]:
-        with st.container(border=True):
-            st.markdown("#### Send a Secure Message")
+        render_send_message(branch_id)
 
-            branches = get_all_branches()
-            other_branches = [
-                (bid, bname, branch_code_fmt(bid))
-                for (bid, bname, _created) in branches
-                if bid != branch_id
-            ]
-
-            if not other_branches:
-                st.info("No other branches are available to message yet.")
-            else:
-                options = {f"{name} ({code})": bid for (bid, name, code) in other_branches}
-                with st.form("send_message_form", clear_on_submit=True):
-                    receiver_label = st.selectbox("Receiver Branch", list(options.keys()))
-                    message_text = st.text_area("Message", max_chars=500, height=140, placeholder="Type your secure message (max 500 characters)...")
-                    submitted = st.form_submit_button("Encrypt & Send", use_container_width=True)
-
-                if submitted:
-                    if not message_text.strip():
-                        st.error("Message cannot be empty.")
-                    elif len(message_text) > 500:
-                        st.error("Message is too long. Maximum allowed length is 500 characters.")
-                    else:
-                        receiver_branch_id = options[receiver_label]
-                        encrypted_message, nonce = encrypt_message(message_text)
-                        sent_date = now_str()
-                        message_id = save_message(branch_id, receiver_branch_id, encrypted_message, nonce, sent_date)
-                        log_activity(
-                            branch_id,
-                            "MESSAGE_SENT",
-                            f"Message sent to {branch_code_fmt(receiver_branch_id)}",
-                            sent_date,
-                        )
-                        st.success(
-                            f"Message #{message_id} sent securely to {receiver_label} at {sent_date}. "
-                            "The message was encrypted with AES-256-GCM before being stored."
-                        )
-
-    # --------------------------------------------------
-    # INBOX
-    # --------------------------------------------------
     with tabs[1]:
-        messages = get_messages_for_branch(branch_id)
-        st.markdown(f"#### Inbox ({len(messages)})")
+        render_message_box(branch_id, "inbox", "ACTIVE", "inbox", "Inbox")
 
-        if not messages:
-            st.info("No messages found.")
-        else:
-            for msg in messages:
-                (message_id, sender_branch_id, receiver_branch_id, encrypted_message, nonce, sent_date, is_read) = msg
-                sender = get_branch_by_id(sender_branch_id)
-                sender_name = sender[1] if sender else "Unknown"
-                status_badge = badge("READ", "neutral") if is_read == 1 else badge("NEW", "success")
-
-                with st.container(border=True):
-                    top = st.columns([5, 3, 2])
-                    top[0].markdown(f"**#{message_id} · From {sender_name} ({branch_code_fmt(sender_branch_id)})**")
-                    top[1].markdown(f"<span class='sb-footnote'>{sent_date}</span>", unsafe_allow_html=True)
-                    top[2].markdown(status_badge, unsafe_allow_html=True)
-
-                    if st.button("Decrypt & View", key=f"open_inbox_{message_id}"):
-                        try:
-                            decrypted = decrypt_message(encrypted_message, nonce)
-                        except InvalidTag:
-                            st.error("Unable to decrypt this message. It may have been modified or corrupted.")
-                        else:
-                            st.markdown(f"<div class='sb-message-box'>{html.escape(decrypted)}</div>", unsafe_allow_html=True)
-
-                            if is_read == 0 and message_id not in st.session_state["branch_read_logged"]:
-                                updated_rows = mark_message_as_read(message_id, branch_id)
-                                if updated_rows == 1:
-                                    log_activity(
-                                        branch_id,
-                                        "MESSAGE_READ",
-                                        f"Message read from {branch_code_fmt(sender_branch_id)}",
-                                        now_str(),
-                                    )
-                                    st.session_state["branch_read_logged"].add(message_id)
-
-    # --------------------------------------------------
-    # SENT MESSAGES
-    # --------------------------------------------------
     with tabs[2]:
-        sent = get_sent_messages_for_branch(branch_id)
-        st.markdown(f"#### Sent Messages ({len(sent)})")
+        render_message_box(branch_id, "sent", "ACTIVE", "sent", "Sent Messages")
 
-        if not sent:
-            st.info("No sent messages found.")
-        else:
-            for msg in sent:
-                (message_id, sender_branch_id, receiver_branch_id, encrypted_message, nonce, sent_date, is_read) = msg
-                receiver = get_branch_by_id(receiver_branch_id)
-                receiver_name = receiver[1] if receiver else "Unknown"
-                status_badge = badge("READ", "success") if is_read == 1 else badge("UNREAD", "warning")
-
-                with st.container(border=True):
-                    top = st.columns([5, 3, 2])
-                    top[0].markdown(f"**#{message_id} · To {receiver_name} ({branch_code_fmt(receiver_branch_id)})**")
-                    top[1].markdown(f"<span class='sb-footnote'>{sent_date}</span>", unsafe_allow_html=True)
-                    top[2].markdown(status_badge, unsafe_allow_html=True)
-
-                    if st.button("Decrypt & View", key=f"open_sent_{message_id}"):
-                        try:
-                            decrypted = decrypt_message(encrypted_message, nonce)
-                        except InvalidTag:
-                            st.error("Unable to decrypt this message. It may have been modified or corrupted.")
-                        else:
-                            st.markdown(f"<div class='sb-message-box'>{html.escape(decrypted)}</div>", unsafe_allow_html=True)
-
-    # --------------------------------------------------
-    # PROFILE
-    # --------------------------------------------------
     with tabs[3]:
+        which = st.radio("Show archived", ["Received", "Sent"], horizontal=True, key="archive_which")
+        if which == "Received":
+            render_message_box(branch_id, "inbox", "ARCHIVED", "archive_inbox", "Archived (received)")
+        else:
+            render_message_box(branch_id, "sent", "ARCHIVED", "archive_sent", "Archived (sent)")
+
+    # --------------------------------------------------
+    # PROFILE & SECURITY
+    # --------------------------------------------------
+    with tabs[4]:
         profile = get_branch_profile(branch_id)
+
         if profile is None:
             st.error("Unable to retrieve branch profile.")
         else:
@@ -679,13 +1181,19 @@ def render_branch_dashboard():
                 c1.markdown(f"**Branch Code**  \n`{session['branch_code']}`")
                 c2.markdown(f"**Branch Name**  \n{branch_name}")
                 c2.markdown(f"**Registered Date**  \n{created_date}")
+                changed = store.get_password_changed_date("branch", branch_id)
+                c2.markdown(f"**Password last changed**  \n{changed or 'Never'}")
                 st.markdown("---")
-                st.markdown(badge("ACCOUNT ACTIVE", "success") + "&nbsp;&nbsp;" + badge("SECURITY PROTECTED", "success"), unsafe_allow_html=True)
+                tfa = badge("2FA ON", "success") if two_factor.is_enabled("branch", branch_id) else badge("2FA OFF", "warning")
+                st.markdown(badge("ACCOUNT ACTIVE", "success") + "&nbsp;&nbsp;" + tfa, unsafe_allow_html=True)
+
+        render_two_factor_panel("branch", branch_id, f"{session['branch_code']}")
+        render_change_password("branch", branch_id, session["branch_name"])
 
     # --------------------------------------------------
     # ACTIVITY HISTORY
     # --------------------------------------------------
-    with tabs[4]:
+    with tabs[5]:
         st.markdown("#### Activity History")
         activities = get_activities_for_branch(branch_id)
 
@@ -701,16 +1209,14 @@ def render_branch_dashboard():
     # --------------------------------------------------
     # LOGOUT
     # --------------------------------------------------
-    with tabs[5]:
+    with tabs[6]:
         with st.container(border=True):
             st.markdown("#### Logout")
             st.write("This will end your secure session. You'll need your branch code and password to sign in again.")
+
             if st.button("Confirm Logout", key="branch_logout_btn"):
-                log_activity(branch_id, "LOGOUT", "Branch logged out", now_str())
-                st.session_state["branch_session"] = None
-                st.session_state["branch_read_logged"] = set()
-                st.session_state["profile_logged_this_session"] = False
-                st.success("You have been securely logged out.")
+                end_session("branch", "LOGOUT", "Branch logged out")
+                flash("success", "You have been securely logged out.")
                 st.rerun()
 
 
@@ -727,52 +1233,265 @@ def render_branch_portal():
 
 def render_admin_auth():
     st.markdown("## \U0001F6E1\uFE0F Admin Portal")
+
+    pending = st.session_state["pending_2fa"]
+    if pending and pending["kind"] == "admin":
+        render_2fa_challenge(pending)
+        return
+
     with st.container(border=True):
         st.markdown("#### Administrator Sign In")
+
         with st.form("admin_login_form", clear_on_submit=True):
             username_input = st.text_input("Username")
             password_input = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Sign In", use_container_width=True)
 
         if submitted:
-            username = username_input.strip()
-            if username == "":
-                st.error("Username cannot be empty.")
+            result = authenticate_admin(username_input, password_input)
+
+            if result.ok:
+                start_admin_session(result)
+                st.rerun()
+            elif result.status == "NEEDS_2FA":
+                st.session_state["pending_2fa"] = {
+                    "kind": "admin",
+                    "account_id": result.account_id,
+                    "name": result.account_name,
+                    "label": result.account_name,
+                    "started": datetime.now(),
+                }
+                st.rerun()
             else:
-                admin = get_admin_by_username(username)
-                if admin is None:
-                    st.error("Invalid username or password.")
-                else:
-                    admin_id, stored_username, stored_hash, stored_salt = admin
+                show_auth_failure(result)
 
-                    if check_admin_login_lock(admin_id):
-                        remaining = get_admin_lock_remaining_time(admin_id)
-                        st.error(
-                            f"Administrator account temporarily locked. Too many failed login attempts.\n\n"
-                            f"Try again in approximately {fmt_lock_wait(remaining)}."
-                        )
-                        st.stop()
-
-                    if password_input == "":
-                        st.error("Password cannot be empty.")
-                    elif verify_password(password_input, stored_hash, stored_salt):
-                        reset_admin_login_attempts(admin_id)
-                        st.session_state["admin_session"] = {"admin_id": admin_id, "username": stored_username}
-                        log_admin_activity(admin_id, "ADMIN_LOGIN", "Administrator logged in", now_str())
-                        st.success("Admin authentication successful. Loading dashboard...")
-                        st.rerun()
-                    else:
-                        failed_attempts = record_admin_failed_attempt(admin_id)
-                        log_admin_activity(admin_id, "ADMIN_FAILED_LOGIN", "Incorrect administrator password", now_str())
-                        if failed_attempts >= 3:
-                            st.error(
-                                f"Invalid username or password. Failed attempts: {failed_attempts}/3.\n\n"
-                                "Administrator account has been temporarily locked for 5 minutes."
-                            )
-                        else:
-                            st.error(f"Invalid username or password. Failed attempts: {failed_attempts}/3.")
-
+    st.caption(
+        "\U0001F511 Forgot your password? Another administrator can issue a temporary password "
+        "(Security Center > Account Recovery). If you are the only administrator, run "
+        "`python -m modules.admin_recovery` on the server."
+    )
     st.caption("Tip: the seed administrator account is created via modules/admin_setup.py (`python -m modules.admin_setup`).")
+
+
+# =============================================================
+# ADMIN PORTAL — ANALYTICS / ALERTS / SECURITY CENTER
+# =============================================================
+
+def _series_frame(series, label):
+    return pd.DataFrame(series, columns=["Day", label]).set_index("Day")
+
+
+def render_admin_analytics():
+    days = st.select_slider("Time window (days)", options=[7, 14, 30], value=14, key="analytics_days")
+    overview = analytics.overview()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Branches", overview["branches"])
+    c2.metric("Messages", overview["messages"])
+    c3.metric("Unread messages", overview["unread"])
+    c4.metric("Urgent messages", overview["urgent"])
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Locked accounts now", overview["locked_now"])
+    c6.metric("Failed logins (24h)", overview["failed_logins_24h"])
+    c7.metric("Branches with 2FA", f"{overview['branches_with_2fa']} / {overview['branches']}")
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("##### Messages per day")
+        st.bar_chart(_series_frame(analytics.messages_per_day(days), "Messages"))
+
+        st.markdown("##### Messages per branch")
+        per_branch = analytics.messages_per_branch()
+        if per_branch:
+            st.bar_chart(pd.DataFrame(per_branch).set_index("Branch"))
+        else:
+            st.info("No branches yet.")
+
+    with right:
+        st.markdown("##### Failed sign-ins per day")
+        st.line_chart(_series_frame(analytics.failed_logins_per_day(days), "Failed sign-ins"))
+
+        st.markdown("##### Account lockouts per day")
+        st.bar_chart(_series_frame(analytics.lockouts_per_day(days), "Lockouts"))
+
+    st.markdown("##### Messages by priority")
+    st.bar_chart(pd.DataFrame(analytics.priority_breakdown()).set_index("Priority"))
+
+
+def render_admin_alerts():
+    st.markdown("#### Suspicious Activity Alerts")
+    st.caption(
+        "Rules checked: repeated lockouts, failed-login spikes, repeated administrator "
+        "failures, message flooding, off-hours administrator sign-ins, administrators without 2FA, "
+        "and audit-log tampering."
+    )
+
+    found = alert_engine.evaluate_alerts()
+
+    if not found:
+        st.success("No suspicious activity detected.")
+    else:
+        counts = {level: sum(1 for a in found if a.severity == level) for level in ("HIGH", "MEDIUM", "LOW")}
+        c1, c2, c3 = st.columns(3)
+        c1.metric("High", counts["HIGH"])
+        c2.metric("Medium", counts["MEDIUM"])
+        c3.metric("Low", counts["LOW"])
+
+        kinds = {"HIGH": "danger", "MEDIUM": "warning", "LOW": "neutral"}
+        for item in found:
+            with st.container(border=True):
+                st.markdown(
+                    f"{badge(item.severity, kinds[item.severity])} &nbsp; **{html.escape(item.title)}**",
+                    unsafe_allow_html=True,
+                )
+                st.caption(item.detail)
+
+    st.download_button(
+        "\u2B07\uFE0F Download alerts (CSV)",
+        data=reports.alerts_report(found),
+        file_name=f"alerts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        key="download_alerts",
+    )
+
+
+def render_admin_security_center(admin_id):
+    # ---------------- audit log integrity ----------------
+    with st.container(border=True):
+        st.markdown("#### \U0001F9FE Audit Log Integrity")
+        st.caption(
+            "Every log entry is chained to the previous one with an HMAC. Editing, deleting or "
+            "inserting rows directly in the database breaks the chain."
+        )
+
+        if st.button("Verify log integrity", key="verify_audit", use_container_width=True):
+            results = verify_all()
+            all_ok = all(r["ok"] for r in results)
+
+            log_admin_activity(
+                admin_id, "AUDIT_VERIFIED",
+                "Audit log integrity verified: " + ("no problems found" if all_ok else "PROBLEMS FOUND"),
+                now_str(),
+            )
+
+            for result in results:
+                if result["ok"]:
+                    st.success(f"{result['table']}: {result['checked']} entries verified \u2014 chain intact.")
+                else:
+                    st.error(f"{result['table']}: tampering detected "
+                             f"(first bad entry: {result['first_bad_log_id']}).")
+                    for problem in result["problems"][:10]:
+                        st.caption(f"\u2022 {problem}")
+
+    # ---------------- encryption keys ----------------
+    with st.container(border=True):
+        st.markdown("#### \U0001F5DD\uFE0F Encryption Keys")
+        status = key_status()
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Active key version", status["active_key_id"])
+        c2.metric("Key versions", len(status["key_ids"]))
+        c3.metric("Messages", status["total_messages"])
+        c4.metric("Need re-encryption", status["needs_reencryption"])
+
+        if status["messages_by_key"]:
+            st.dataframe(
+                [{"Key version": k, "Messages": v} for k, v in sorted(status["messages_by_key"].items())],
+                use_container_width=True, hide_index=True,
+            )
+
+        st.warning("Back up the files in the config/ folder. Messages cannot be decrypted without their key version.")
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            confirm_rotate = st.checkbox("I understand a new key version will be created", key="confirm_rotate")
+            if st.button("Rotate encryption key", key="rotate_key", disabled=not confirm_rotate,
+                         use_container_width=True):
+                new_id = rotate_key(admin_id)
+                flash("success", f"Key version {new_id} is now active. New messages use it automatically.")
+                st.rerun()
+
+        with col_b:
+            if st.button("Re-encrypt messages with active key", key="reencrypt",
+                         disabled=status["needs_reencryption"] == 0, use_container_width=True):
+                outcome = reencrypt_all_messages(admin_id)
+                text = f"Re-encrypted {outcome['reencrypted']} message(s)."
+                if outcome["skipped"]:
+                    text += f" Skipped damaged message(s): {outcome['skipped']}."
+                flash("success", text)
+                st.rerun()
+
+    # ---------------- account recovery ----------------
+    with st.container(border=True):
+        st.markdown("#### \U0001F6DF Account Recovery")
+        st.caption(
+            "Forgot password: Issue temporary password. Lost authenticator phone: Reset 2FA. "
+            "Password may be exposed: Require password change."
+        )
+
+        with st.form("recovery_form", clear_on_submit=True):
+            account_type = st.radio("Account type", ["Branch", "Administrator"], horizontal=True)
+            target_text = st.text_input("Branch code (e.g. SB003) or administrator username").strip()
+            col_a, col_b, col_c = st.columns(3)
+            temp_pw_clicked = col_a.form_submit_button("Issue temporary password", use_container_width=True)
+            reset_2fa_clicked = col_b.form_submit_button("Reset 2FA", use_container_width=True)
+            force_pw_clicked = col_c.form_submit_button("Require password change", use_container_width=True)
+
+        if temp_pw_clicked or reset_2fa_clicked or force_pw_clicked:
+            target = None
+
+            if target_text == "":
+                st.error("Enter a branch code or username.")
+            elif account_type == "Branch":
+                if not validate_branch_code(target_text.upper()):
+                    st.error("Invalid Branch Code.")
+                else:
+                    branch = get_branch_by_id(int(target_text[2:]))
+                    if branch is None:
+                        st.error("Branch not found.")
+                    else:
+                        target = ("branch", branch[0], f"{target_text.upper()} ({branch[1]})")
+            else:
+                found_admin = get_admin_by_username(target_text)
+                if found_admin is None:
+                    st.error("Administrator not found.")
+                else:
+                    target = ("admin", found_admin[0], found_admin[1])
+
+            if target:
+                kind, target_id, target_label = target
+
+                if temp_pw_clicked:
+                    try:
+                        temporary = issue_temporary_password(admin_id, kind, target_id)
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.success(f"Temporary password issued for {target_label}.")
+                        st.code(temporary, language=None)
+                        st.warning(
+                            "Shown ONLY ONCE \u2014 it is not stored in readable form and is not in any log. "
+                            f"Give it to the user through a safe channel. It works for {TEMP_PASSWORD_HOURS} hours, "
+                            "the user must choose a new password at sign-in, and any lockout was cleared. "
+                            "If the user also lost their authenticator phone, use Reset 2FA as well."
+                        )
+                elif reset_2fa_clicked:
+                    if two_factor.admin_reset(kind, target_id):
+                        log_admin_activity(admin_id, "ADMIN_RESET_2FA",
+                                           f"Administrator reset two-factor authentication for {target_label}",
+                                           now_str())
+                        st.success(f"Two-factor authentication removed for {target_label}.")
+                    else:
+                        st.info(f"{target_label} does not have two-factor authentication enabled.")
+                else:
+                    force_password_change(kind, target_id)
+                    log_admin_activity(admin_id, "ADMIN_FORCE_PASSWORD_CHANGE",
+                                       f"Administrator required a password change for {target_label}",
+                                       now_str())
+                    st.success(f"{target_label} must choose a new password at the next sign-in.")
 
 
 # =============================================================
@@ -786,14 +1505,31 @@ def render_admin_dashboard():
     st.markdown(f"## \U0001F6E1\uFE0F Welcome, {admin['username']}")
     st.caption("Administrator Dashboard")
 
+    if admin.get("must_change_password"):
+        st.warning(
+            "You must choose a new password before you continue. "
+            "If you were given a temporary password, enter it as the current password."
+        )
+        render_change_password("admin", admin_id, admin["username"])
+        if st.button("Sign out", key="forced_admin_logout"):
+            end_session("admin", "ADMIN_LOGOUT", "Administrator logged out")
+            st.rerun()
+        return
+
     tabs = st.tabs([
         "\U0001F3E6 Branches",
         "\u2709\uFE0F Messages",
         "\U0001F4CB System Activity",
         "\U0001F510 Login Security",
+        "\U0001F4CA Analytics",
+        "\U0001F6A8 Alerts",
+        "\U0001F6E1\uFE0F Security Center",
         "\u2795 Register Admin",
+        "\U0001F464 My Account",
         "\U0001F6AA Logout",
     ])
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # --------------------------------------------------
     # BRANCHES
@@ -801,11 +1537,18 @@ def render_admin_dashboard():
     with tabs[0]:
         branches = get_all_branches_admin()
         st.markdown(f"#### All Branches ({len(branches)})")
+
         if not branches:
             st.info("No branches registered.")
         else:
             rows = [
-                {"Branch ID": b[0], "Branch Code": branch_code_fmt(b[0]), "Branch Name": b[1], "Registered Date": b[2]}
+                {
+                    "Branch ID": b[0],
+                    "Branch Code": branch_code_fmt(b[0]),
+                    "Branch Name": b[1],
+                    "Registered Date": b[2],
+                    "2FA": "ON" if two_factor.is_enabled("branch", b[0]) else "OFF",
+                }
                 for b in branches
             ]
             st.dataframe(rows, use_container_width=True, hide_index=True)
@@ -817,6 +1560,7 @@ def render_admin_dashboard():
         messages = get_all_messages_admin()
         st.markdown(f"#### All Messages ({len(messages)})")
         st.caption("Administrators can view message metadata only. Message content remains encrypted and is never displayed here.")
+
         if not messages:
             st.info("No messages found.")
         else:
@@ -833,26 +1577,69 @@ def render_admin_dashboard():
             ]
             st.dataframe(rows, use_container_width=True, hide_index=True)
 
+            st.download_button(
+                "\u2B07\uFE0F Download message metadata (CSV)",
+                data=reports.messages_report(),
+                file_name=f"message_metadata_{stamp}.csv",
+                mime="text/csv",
+                key="download_messages",
+            )
+
     # --------------------------------------------------
     # SYSTEM ACTIVITY
     # --------------------------------------------------
     with tabs[2]:
         activities = get_all_activities_admin()
-        st.markdown(f"#### System Activity ({len(activities)})")
-        if not activities:
+
+        col_a, col_b, col_c = st.columns([2, 3, 2])
+        actor_filter = col_a.selectbox("Actor type", ["All", "BRANCH", "ADMIN"], key="act_actor")
+        keyword = col_b.text_input("Search type, actor or description", key="act_keyword")
+        use_dates = col_c.checkbox("Filter by date", key="act_use_dates")
+
+        date_from = date_to = None
+        if use_dates:
+            col_d, col_e = st.columns(2)
+            date_from = col_d.date_input("From date", value=date.today() - timedelta(days=7), key="act_from")
+            date_to = col_e.date_input("To date", value=date.today(), key="act_to")
+
+        needle = keyword.strip().lower()
+        filtered = []
+        for a in activities:
+            if actor_filter != "All" and a[0] != actor_filter:
+                continue
+            if needle and needle not in f"{a[1]} {a[2]} {a[3]}".lower():
+                continue
+            if date_from and a[4][:10] < str(date_from):
+                continue
+            if date_to and a[4][:10] > str(date_to):
+                continue
+            filtered.append(a)
+
+        st.markdown(f"#### System Activity ({len(filtered)} of {len(activities)})")
+
+        if not filtered:
             st.info("No activity records found.")
         else:
             rows = [
                 {"Type": a[0], "Actor": a[1], "Activity": a[2], "Description": a[3], "Date & Time": a[4]}
-                for a in activities
+                for a in filtered
             ]
             st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "\u2B07\uFE0F Download activity report (CSV)",
+            data=reports.activity_report(date_from, date_to),
+            file_name=f"activity_report_{stamp}.csv",
+            mime="text/csv",
+            key="download_activity",
+        )
 
     # --------------------------------------------------
     # LOGIN SECURITY
     # --------------------------------------------------
     with tabs[3]:
         st.markdown("#### Branch Login Security")
+
         branch_records = get_all_login_security_admin()
         current_time = datetime.now()
 
@@ -876,7 +1663,16 @@ def render_admin_dashboard():
                 })
             st.dataframe(rows, use_container_width=True, hide_index=True)
 
+            st.download_button(
+                "\u2B07\uFE0F Download login security (CSV)",
+                data=reports.login_security_report(),
+                file_name=f"login_security_{stamp}.csv",
+                mime="text/csv",
+                key="download_login_security",
+            )
+
         st.markdown("##### Unlock / Reset a Branch")
+
         with st.form("branch_security_form", clear_on_submit=True):
             branch_code_target = st.text_input("Branch Code", placeholder="e.g. SB003").strip().upper()
             col_a, col_b = st.columns(2)
@@ -889,16 +1685,19 @@ def render_admin_dashboard():
                 and len(branch_code_target) == 5
                 and branch_code_target[2:].isdigit()
             )
+
             if not valid:
                 st.error("Invalid Branch Code.")
             else:
                 target_id = int(branch_code_target[2:])
                 target_branch = get_branch_by_id(target_id)
+
                 if target_branch is None:
                     st.error("Branch not found.")
                 else:
                     target_name = target_branch[1]
                     success = reset_branch_login_security(target_id)
+
                     if success:
                         action = "ADMIN_UNLOCK_BRANCH" if unlock_clicked else "ADMIN_RESET_BRANCH_ATTEMPTS"
                         verb = "unlocked" if unlock_clicked else "reset failed login attempts for"
@@ -907,12 +1706,13 @@ def render_admin_dashboard():
                             f"Administrator {verb} branch {branch_code_target} ({target_name})",
                             now_str(),
                         )
-                        st.success(f"Branch {branch_code_target} ({target_name}) — failed attempts reset to 0, lock status: NOT LOCKED.")
+                        st.success(f"Branch {branch_code_target} ({target_name}) \u2014 failed attempts reset to 0, lock status: NOT LOCKED.")
                     else:
                         st.error("Unable to update branch security record.")
 
         st.markdown("---")
         st.markdown("#### Administrator Login Security")
+
         admin_records = get_all_admin_login_security_details()
 
         if not admin_records:
@@ -936,6 +1736,7 @@ def render_admin_dashboard():
             st.dataframe(rows, use_container_width=True, hide_index=True)
 
         st.markdown("##### Unlock / Reset an Administrator")
+
         with st.form("admin_security_form", clear_on_submit=True):
             username_target = st.text_input("Admin Username").strip()
             col_a, col_b = st.columns(2)
@@ -947,11 +1748,13 @@ def render_admin_dashboard():
                 st.error("Username cannot be empty.")
             else:
                 target_admin = get_admin_by_username(username_target)
+
                 if target_admin is None:
                     st.error("Administrator not found.")
                 else:
                     target_admin_id, target_username = target_admin[0], target_admin[1]
                     success = reset_admin_login_security(target_admin_id)
+
                     if success:
                         action = "ADMIN_UNLOCK_ADMIN" if unlock_admin_clicked else "ADMIN_RESET_ADMIN_ATTEMPTS"
                         verb = "unlocked account" if unlock_admin_clicked else "reset failed login attempts for account"
@@ -960,28 +1763,41 @@ def render_admin_dashboard():
                             f"Administrator {verb} '{target_username}'",
                             now_str(),
                         )
-                        st.success(f"Administrator '{target_username}' — failed attempts reset to 0, lock status: NOT LOCKED.")
+                        st.success(f"Administrator '{target_username}' \u2014 failed attempts reset to 0, lock status: NOT LOCKED.")
                     else:
                         st.error("Unable to update administrator security record.")
 
     # --------------------------------------------------
-    # REGISTER NEW ADMIN
+    # ANALYTICS / ALERTS / SECURITY CENTER
     # --------------------------------------------------
     with tabs[4]:
+        render_admin_analytics()
+
+    with tabs[5]:
+        render_admin_alerts()
+
+    with tabs[6]:
+        render_admin_security_center(admin_id)
+
+    # --------------------------------------------------
+    # REGISTER NEW ADMIN
+    # --------------------------------------------------
+    with tabs[7]:
         with st.container(border=True):
             st.markdown("#### Register a New Administrator")
             st.caption(
                 "Password must be at least 10 characters and include an uppercase letter, "
                 "a lowercase letter, a digit, and a special character."
             )
-            with st.form("admin_register_form", clear_on_submit=True):
-                new_username = st.text_input("Username")
-                new_password = st.text_input("Password", type="password")
-                confirm_password = st.text_input("Confirm Password", type="password")
-                submitted = st.form_submit_button("Register Administrator", use_container_width=True)
 
-            if submitted:
+            new_username = st.text_input("Username", key=nk("adm_reg_user"))
+            new_password = st.text_input("Password", type="password", key=nk("adm_reg_pw"))
+            strength_meter(new_password, context_words=(new_username,))
+            confirm_password = st.text_input("Confirm Password", type="password", key=nk("adm_reg_confirm"))
+
+            if st.button("Register Administrator", use_container_width=True, key=nk("adm_reg_button")):
                 username = new_username.strip()
+
                 if username == "":
                     st.error("Username cannot be empty.")
                 elif len(username) < 3:
@@ -1001,21 +1817,28 @@ def render_admin_dashboard():
                     st.error("Passwords do not match.")
                 else:
                     password_hash, password_salt = hash_password(new_password)
-                    created_date = now_str()
-                    new_admin_id = insert_admin(username, password_hash, password_salt, created_date)
+                    new_admin_id = insert_admin(username, password_hash, password_salt, now_str())
                     log_admin_activity(admin_id, "ADMIN_CREATED", f"Created new administrator '{username}'", now_str())
+                    bump_nonce()
                     st.success(f"Administrator '{username}' created successfully (Admin ID {new_admin_id}).")
+
+    # --------------------------------------------------
+    # MY ACCOUNT
+    # --------------------------------------------------
+    with tabs[8]:
+        render_two_factor_panel("admin", admin_id, admin["username"])
+        render_change_password("admin", admin_id, admin["username"])
 
     # --------------------------------------------------
     # LOGOUT
     # --------------------------------------------------
-    with tabs[5]:
+    with tabs[9]:
         with st.container(border=True):
             st.markdown("#### Logout")
+
             if st.button("Confirm Logout", key="admin_logout_btn"):
-                log_admin_activity(admin_id, "ADMIN_LOGOUT", "Administrator logged out", now_str())
-                st.session_state["admin_session"] = None
-                st.success("Administrator securely logged out.")
+                end_session("admin", "ADMIN_LOGOUT", "Administrator logged out")
+                flash("success", "Administrator securely logged out.")
                 st.rerun()
 
 
@@ -1029,6 +1852,8 @@ def render_admin_portal():
 # =============================================================
 # ROUTER
 # =============================================================
+
+show_flash()
 
 page = st.session_state["page"]
 

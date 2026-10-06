@@ -122,3 +122,19 @@ Database
 ```
 
 This makes the project easier to maintain and improves separation of responsibilities.
+
+---
+
+# Additions (Final Project)
+
+```text
+database/   connection.py, store.py, migrations.py
+modules/    auth_service.py, two_factor.py, totp.py, password_policy.py,
+            messaging_service.py, key_management.py, audit_chain.py,
+            alerts.py, analytics.py, reports.py, session_timeout.py,
+            account_lock.py, admin_recovery.py
+tests/      10 test modules (135 tests) + ui_smoke/ (UI flow test)
+docs/       Enhancements.md (new)
+pytest.ini  test configuration
+.streamlit/ config.toml (light theme)
+```

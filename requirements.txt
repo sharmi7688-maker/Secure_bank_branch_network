@@ -1,2 +1,5 @@
 cryptography>=41.0.0
 streamlit>=1.32.0
+pandas>=2.0.0
+qrcode[pil]>=7.4  # optional: QR code for 2FA setup (the key can be typed instead)
+pytest>=7.0.0     # only needed to run the test suite

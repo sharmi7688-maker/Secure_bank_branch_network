@@ -280,3 +280,16 @@ Production deployments should:
 8. Keep dependencies updated.
 9. Use strong administrator passwords.
 10. Perform regular security testing.
+
+---
+
+# Final Project Additions
+
+* **Two-factor authentication:** optional TOTP (RFC 6238) for branches and administrators; secrets stored encrypted; replay-protected; failed codes count toward lockout.
+* **Session security:** 10-minute inactivity timeout, 5-minute window for the second login step, password change with the current password, forced password change by an administrator.
+* **Audit integrity:** HMAC-SHA256 hash chain over both log tables, key kept outside the database (`config/audit.key`), on-demand verification and a HIGH alert on tampering.
+* **Encryption:** versioned AES-256-GCM keys with rotation and re-encryption; sender, receiver and sent time are authenticated data, so edited or moved ciphertexts fail to decrypt.
+* **Forgotten password:** administrator-issued random temporary password (shown once, stored hashed, never logged, 24-hour expiry, forced change at next sign-in, lockout cleared, audited on both sides); administrators cannot issue one for themselves; last-administrator recovery only through the server console (`python -m modules.admin_recovery`).
+* **Monitoring:** rule-based suspicious-activity alerts; CSV exports protected against formula injection; message text HTML-escaped on display.
+
+See `docs/Enhancements.md` for details and limitations.
