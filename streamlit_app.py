@@ -851,15 +851,20 @@ def render_branch_register():
                 code = branch_code_fmt(branch_id)
                 bump_nonce()
 
-                st.success("Registration successful!")
-                with st.container(border=True):
-                    st.markdown(f"**Branch ID**  \n{branch_id}")
-                    st.markdown(f"**Branch Code**  \n`{code}`")
-                    st.markdown(f"**Branch Name**  \n{name}")
-                st.info("Save your branch code — you'll need it to sign in. "
-                        "You can enable two-factor authentication from "
-                        "Profile & Security after signing in.")
+                # Keep the result, then rerun so the input fields come back empty
+                st.session_state["reg_success"] = {"id": branch_id, "code": code, "name": name}
+                st.rerun()
 
+        done = st.session_state.pop("reg_success", None)
+        if done:
+            st.success("Registration successful!")
+            with st.container(border=True):
+                st.markdown(f"**Branch ID**  \n{done['id']}")
+                st.markdown(f"**Branch Code**  \n`{done['code']}`")
+                st.markdown(f"**Branch Name**  \n{done['name']}")
+            st.info("Save your branch code — you'll need it to sign in. "
+                    "You can enable two-factor authentication from "
+                    "Profile & Security after signing in.")
 
 def render_branch_auth():
     st.markdown("## \U0001F3E6 Branch Portal")
