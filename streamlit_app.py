@@ -866,19 +866,22 @@ def render_branch_register():
                     "You can enable two-factor authentication from "
                     "Profile & Security after signing in.")
 
+
 def render_branch_auth():
     st.markdown("## \U0001F3E6 Branch Portal")
 
-    tab_login, tab_register = st.tabs(["Sign In", "Register New Branch"])
+    # st.tabs forgets the chosen tab on every rerun, so a keyed radio is used
+    auth_sections = ["Sign In", "Register New Branch"]
+    auth_choice = st.radio("Branch portal section", auth_sections, horizontal=True,
+                           key="auth_section", label_visibility="collapsed")
 
-    with tab_login:
+    if auth_choice == auth_sections[0]:
         pending = st.session_state["pending_2fa"]
         if pending and pending["kind"] == "branch":
             render_2fa_challenge(pending)
         else:
             render_branch_login_form()
-
-    with tab_register:
+    else:
         render_branch_register()
 
 
@@ -1138,7 +1141,9 @@ def render_branch_dashboard():
             st.rerun()
         return
 
-    tabs = st.tabs([
+    # st.tabs jumps back to the first tab after every rerun (button click,
+    # st.rerun, download...). A keyed radio remembers the chosen section.
+    tab_names = [
         "\U0001F4E4 Send Message",
         "\U0001F4E5 Inbox",
         "\U0001F4EC Sent",
@@ -1146,18 +1151,20 @@ def render_branch_dashboard():
         "\U0001F464 Profile & Security",
         "\U0001F4CB Activity History",
         "\U0001F6AA Logout",
-    ])
+    ]
+    selected_tab = st.radio("Section", tab_names, horizontal=True,
+                            key="branch_section", label_visibility="collapsed")
 
-    with tabs[0]:
+    if selected_tab == tab_names[0]:
         render_send_message(branch_id)
 
-    with tabs[1]:
+    if selected_tab == tab_names[1]:
         render_message_box(branch_id, "inbox", "ACTIVE", "inbox", "Inbox")
 
-    with tabs[2]:
+    if selected_tab == tab_names[2]:
         render_message_box(branch_id, "sent", "ACTIVE", "sent", "Sent Messages")
 
-    with tabs[3]:
+    if selected_tab == tab_names[3]:
         which = st.radio("Show archived", ["Received", "Sent"], horizontal=True, key="archive_which")
         if which == "Received":
             render_message_box(branch_id, "inbox", "ARCHIVED", "archive_inbox", "Archived (received)")
@@ -1167,7 +1174,7 @@ def render_branch_dashboard():
     # --------------------------------------------------
     # PROFILE & SECURITY
     # --------------------------------------------------
-    with tabs[4]:
+    if selected_tab == tab_names[4]:
         profile = get_branch_profile(branch_id)
 
         if profile is None:
@@ -1198,7 +1205,7 @@ def render_branch_dashboard():
     # --------------------------------------------------
     # ACTIVITY HISTORY
     # --------------------------------------------------
-    with tabs[5]:
+    if selected_tab == tab_names[5]:
         st.markdown("#### Activity History")
         activities = get_activities_for_branch(branch_id)
 
@@ -1214,7 +1221,7 @@ def render_branch_dashboard():
     # --------------------------------------------------
     # LOGOUT
     # --------------------------------------------------
-    with tabs[6]:
+    if selected_tab == tab_names[6]:
         with st.container(border=True):
             st.markdown("#### Logout")
             st.write("This will end your secure session. You'll need your branch code and password to sign in again.")
@@ -1412,10 +1419,11 @@ def render_admin_security_center(admin_id):
         col_a, col_b = st.columns(2)
 
         with col_a:
-            confirm_rotate = st.checkbox("I understand a new key version will be created", key="confirm_rotate")
-            if st.button("Rotate encryption key", key="rotate_key", disabled=not confirm_rotate,
+            confirm_rotate = st.checkbox("I understand a new key version will be created", key=nk("confirm_rotate"))
+            if st.button("Rotate encryption key", key=nk("rotate_key"), disabled=not confirm_rotate,
                          use_container_width=True):
                 new_id = rotate_key(admin_id)
+                bump_nonce()          # un-ticks the confirmation box again
                 flash("success", f"Key version {new_id} is now active. New messages use it automatically.")
                 st.rerun()
 
@@ -1521,7 +1529,9 @@ def render_admin_dashboard():
             st.rerun()
         return
 
-    tabs = st.tabs([
+    # st.tabs jumps back to the first tab after every rerun, so a keyed
+    # radio is used: the chosen section stays selected.
+    tab_names = [
         "\U0001F3E6 Branches",
         "\u2709\uFE0F Messages",
         "\U0001F4CB System Activity",
@@ -1532,14 +1542,16 @@ def render_admin_dashboard():
         "\u2795 Register Admin",
         "\U0001F464 My Account",
         "\U0001F6AA Logout",
-    ])
+    ]
+    selected_tab = st.radio("Section", tab_names, horizontal=True,
+                            key="admin_section", label_visibility="collapsed")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # --------------------------------------------------
     # BRANCHES
     # --------------------------------------------------
-    with tabs[0]:
+    if selected_tab == tab_names[0]:
         branches = get_all_branches_admin()
         st.markdown(f"#### All Branches ({len(branches)})")
 
@@ -1561,7 +1573,7 @@ def render_admin_dashboard():
     # --------------------------------------------------
     # MESSAGES (metadata only — content is never decrypted for admins)
     # --------------------------------------------------
-    with tabs[1]:
+    if selected_tab == tab_names[1]:
         messages = get_all_messages_admin()
         st.markdown(f"#### All Messages ({len(messages)})")
         st.caption("Administrators can view message metadata only. Message content remains encrypted and is never displayed here.")
@@ -1593,7 +1605,7 @@ def render_admin_dashboard():
     # --------------------------------------------------
     # SYSTEM ACTIVITY
     # --------------------------------------------------
-    with tabs[2]:
+    if selected_tab == tab_names[2]:
         activities = get_all_activities_admin()
 
         col_a, col_b, col_c = st.columns([2, 3, 2])
@@ -1642,7 +1654,7 @@ def render_admin_dashboard():
     # --------------------------------------------------
     # LOGIN SECURITY
     # --------------------------------------------------
-    with tabs[3]:
+    if selected_tab == tab_names[3]:
         st.markdown("#### Branch Login Security")
 
         branch_records = get_all_login_security_admin()
@@ -1775,19 +1787,19 @@ def render_admin_dashboard():
     # --------------------------------------------------
     # ANALYTICS / ALERTS / SECURITY CENTER
     # --------------------------------------------------
-    with tabs[4]:
+    if selected_tab == tab_names[4]:
         render_admin_analytics()
 
-    with tabs[5]:
+    if selected_tab == tab_names[5]:
         render_admin_alerts()
 
-    with tabs[6]:
+    if selected_tab == tab_names[6]:
         render_admin_security_center(admin_id)
 
     # --------------------------------------------------
     # REGISTER NEW ADMIN
     # --------------------------------------------------
-    with tabs[7]:
+    if selected_tab == tab_names[7]:
         with st.container(border=True):
             st.markdown("#### Register a New Administrator")
             st.caption(
@@ -1825,19 +1837,26 @@ def render_admin_dashboard():
                     new_admin_id = insert_admin(username, password_hash, password_salt, now_str())
                     log_admin_activity(admin_id, "ADMIN_CREATED", f"Created new administrator '{username}'", now_str())
                     bump_nonce()
-                    st.success(f"Administrator '{username}' created successfully (Admin ID {new_admin_id}).")
+
+                    # Keep the result, then rerun so the input fields come back empty
+                    st.session_state["admin_reg_success"] = {"username": username, "id": new_admin_id}
+                    st.rerun()
+
+            done = st.session_state.pop("admin_reg_success", None)
+            if done:
+                st.success(f"Administrator '{done['username']}' created successfully (Admin ID {done['id']}).")
 
     # --------------------------------------------------
     # MY ACCOUNT
     # --------------------------------------------------
-    with tabs[8]:
+    if selected_tab == tab_names[8]:
         render_two_factor_panel("admin", admin_id, admin["username"])
         render_change_password("admin", admin_id, admin["username"])
 
     # --------------------------------------------------
     # LOGOUT
     # --------------------------------------------------
-    with tabs[9]:
+    if selected_tab == tab_names[9]:
         with st.container(border=True):
             st.markdown("#### Logout")
 
