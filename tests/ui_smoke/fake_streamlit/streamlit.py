@@ -77,9 +77,14 @@ def selectbox(label, options, key=None, **kw):
 def radio(label, options, key=None, **kw):
     options = list(options)
     v = _lookup(key, label, None)
+    if v is None and key is not None and key in session_state:
+        v = session_state[key]          # a keyed widget remembers its value between runs
     if v is None:
         idx = kw.get("index", 0) or 0
         v = options[idx]
+    if key is not None:
+        session_state[key] = v
+    _rec("radio", "|".join(options))
     return v
 def select_slider(label, options=None, value=None, key=None, **kw):
     return _lookup(key, label, value if value is not None else list(options)[0])

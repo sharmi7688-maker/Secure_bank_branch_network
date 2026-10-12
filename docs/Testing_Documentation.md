@@ -227,4 +227,4 @@ The older `modules/test_*.py` and `verify_*.py` helper scripts remain, but the r
 
 Run: `python -m pytest` (or `python -m unittest discover -s tests -t .` without pytest).
 
-**UI smoke test:** `python tests/ui_smoke/run_ui_smoke.py` runs the real `streamlit_app.py` against a small fake Streamlit module in a temporary copy of the project and performs 61 checks (sign-in failures, 2FA set-up and login, messaging and replies, archive, password change, idle timeout, admin dashboard, key rotation, tamper detection, temporary-password recovery, light-theme CSS). It does not replace testing the visuals in a browser.
+**UI smoke test:** `python tests/ui_smoke/run_ui_smoke.py` runs the real `streamlit_app.py` against a small fake Streamlit module in a temporary copy of the project and performs 83 checks (sign-in failures, 2FA set-up and login, messaging and replies, archive, password change, idle timeout, admin dashboard, key rotation, tamper detection, temporary-password recovery, light-theme CSS, staying on the same section after every button, form fields clearing after a successful submit). It does not replace testing the visuals in a browser.
